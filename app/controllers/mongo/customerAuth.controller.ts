@@ -1,22 +1,37 @@
 import { Request, Response, NextFunction } from "express";
 import Customer from "../../models/mongo/customer.model";
 import CustomerAuthModel from "../../models/mongo/customerAuth.model";
-import { hashPassword, comparePasswords } from "../../services/password.service";
+import {
+  hashPassword,
+  comparePasswords,
+  generateResetToken 
+} from "../../services/password.service";
 import { responseHandler } from "../../services/responseHandler.service";
 import { resCode } from "../../constants/resCode";
-import jwt from "jsonwebtoken";
-import { get } from "../../config/config";
-const config = get(process.env.NODE_ENV || 'development');
 import { authToken } from "../../services/authToken.service";
+import customerAuthModel from "../../models/mongo/customerAuth.model";
+import jwt from "jsonwebtoken";
+// import randomstring from "randomstring";
 
-const signupCustomer = async (req: Request, res: Response, next: NextFunction) => {
+
+const signupCustomer = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+) => {
   try {
     const { cus_password, cus_confirm_password, ...rest } = req.body;
 
+    // Check if passwords match
     if (cus_password !== cus_confirm_password) {
-      return responseHandler.error(res, "Passwords do not match", resCode.BAD_REQUEST);
+      return responseHandler.error(
+        res,
+        "Passwords do not match",
+        resCode.BAD_REQUEST
+      );
     }
 
+    // Check if email or phone already exists
     const existing = await Customer.findOne({
       $or: [
         { cus_email: req.body.cus_email },
@@ -25,44 +40,97 @@ const signupCustomer = async (req: Request, res: Response, next: NextFunction) =
     });
 
     if (existing) {
-      return responseHandler.error(res, "Email or phone already registered", resCode.BAD_REQUEST);
+      return responseHandler.error(
+        res,
+        "Email or phone already registered",
+        resCode.BAD_REQUEST
+      );
     }
 
+    // Hash password
     const hashedPassword = await hashPassword(cus_password);
 
+    // Create customer
     const newCustomer = new Customer({
       ...rest,
+
       cus_password: hashedPassword,
       cus_confirm_password: hashedPassword,
     });
 
     await newCustomer.save();
 
-    return responseHandler.success(res, "Signup successful", newCustomer, resCode.CREATED);
+    // ✅ Auto-login after signup
+    const token = authToken.generateAuthToken({
+      user_id: newCustomer._id,
+      email: newCustomer.cus_email,
+    });
+
+    const refreshToken = authToken.generateRefreshAuthToken({
+      user_id: newCustomer._id,
+      email: newCustomer.cus_email,
+    });
+
+    // Save tokens
+    await CustomerAuthModel.create({
+      cus_id: newCustomer._id,
+      cus_email: newCustomer.cus_email,
+      cus_phone_number: newCustomer.cus_phone_number,
+      cus_password: newCustomer.cus_password,
+      cus_auth_token: token,
+      cus_refresh_auth_token: refreshToken,
+    });
+
+    // Return success with token and customer
+    return responseHandler.success(
+      res,
+      "Signup successful",
+      { token, refreshToken, customer: newCustomer },
+      resCode.CREATED
+    );
   } catch (error) {
     return next(error);
   }
 };
 
-
-
-const loginCustomer = async (req: Request, res: Response, next: NextFunction) => {
+const loginCustomer = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+) => {
   try {
     const { cus_email, cus_password } = req.body;
 
     if (!cus_email || !cus_password) {
-      return responseHandler.error(res, "Email and password are required", resCode.BAD_REQUEST);
+      return responseHandler.error(
+        res,
+        "Email and password are required",
+        resCode.BAD_REQUEST
+      );
     }
 
-    const customer = await Customer.findOne({ cus_email: cus_email.toLowerCase() });
+    const customer = await Customer.findOne({
+      cus_email: cus_email.toLowerCase(),
+    });
 
     if (!customer) {
-      return responseHandler.error(res, "Customer not found", resCode.NOT_FOUND);
+      return responseHandler.error(
+        res,
+        "Customer not found",
+        resCode.NOT_FOUND
+      );
     }
 
-    const isPasswordValid = await comparePasswords(cus_password, customer.cus_password);
+    const isPasswordValid = await comparePasswords(
+      cus_password,
+      customer.cus_password
+    );
     if (!isPasswordValid) {
-      return responseHandler.error(res, "Invalid password", resCode.UNAUTHORIZED);
+      return responseHandler.error(
+        res,
+        "Invalid password",
+        resCode.UNAUTHORIZED
+      );
     }
 
     // ✅ Use authToken service
@@ -95,64 +163,80 @@ const loginCustomer = async (req: Request, res: Response, next: NextFunction) =>
 
 
 
+// 🔁 RESET PASSWORD
 
 
-// const loginCustomer = async (req: Request, res: Response, next: NextFunction) => {
-//   try {
-//     const { cus_email, cus_password } = req.body;
+// 📩 FORGOT PASSWORD
+const forgotPassword = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { cus_email } = req.body;
 
-//     // Basic input validation
-//     if (!cus_email || !cus_password) {
-//       return responseHandler.error(res, "Email and password are required", resCode.BAD_REQUEST);
-//     }
+    if (!cus_email) {
+      return responseHandler.error(res, "Email is required", resCode.BAD_REQUEST);
+    }
 
-//     // Find customer by email (normalize if needed)
-//     const customer = await Customer.findOne({ cus_email: cus_email.toLowerCase() });
+    const customer = await customerAuthModel.findOne({ cus_email });
 
-//     if (!customer) {
-//       return responseHandler.error(res, "Customer not found", resCode.NOT_FOUND);
-//     }
+    if (!customer) {
+      return responseHandler.error(res, "Customer not found", resCode.NOT_FOUND);
+    }
 
-//     // Validate password
-//     const isPasswordValid = await comparePasswords(cus_password, customer.cus_password);
-//     if (!isPasswordValid) {
-//       return responseHandler.error(res, "Invalid password", resCode.UNAUTHORIZED);
-//     }
+    const resetToken = generateResetToken()
 
-//     // Generate auth token
-//     const payload = { id: customer._id, email: customer.cus_email };
-//     const token = jwt.sign(payload, config.SECURITY_TOKEN, {
-//       expiresIn: config.TOKEN_EXPIRES_IN,
-//     });
+    // Save token temporarily in DB
+    customer.reset_token = resetToken;
+    await customer.save();
 
-//     // Generate refresh token (optional but included for structure)
-//     const refreshToken = jwt.sign(payload, config.SECURITY_TOKEN, {
-//       expiresIn: config.REFRESH_TOKEN_EXPIRES_IN,
-//     });
+    // In real case: send resetToken via email
+    // For dev/test: return the token
+    return responseHandler.success(
+      res,
+      "Reset token generated successfully",
+      { resetToken },
+      resCode.OK
+    );
+  } catch (error) {
+    return next(error);
+  }
+};
 
-//     // Save tokens to CustomerAuthModel
-//     await CustomerAuthModel.create({
-//       cus_id: customer._id,
-//       cus_auth_token: token,
-//       cus_refresh_auth_token: refreshToken,
-//     });
+const resetPassword = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { reset_token, new_password, confirm_password } = req.body;
 
-//     // Send success response
-//     return responseHandler.success(
-//       res,
-//       "Login successful",
-//       { token, refreshToken, customer },
-//       resCode.OK
-//     );
-//   } catch (error) {
-//     return next(error);
-//   }
-// };
+    if (!reset_token || !new_password || !confirm_password) {
+      return responseHandler.error(res, "All fields are required", resCode.BAD_REQUEST);
+    }
 
-// export { loginCustomer };
+    if (new_password !== confirm_password) {
+      return responseHandler.error(res, "Passwords do not match", resCode.BAD_REQUEST);
+    }
+
+    // ✅ Find user by reset token
+    const customer = await customerAuthModel.findOne({ reset_token });
+
+    if (!customer) {
+      return responseHandler.error(res, "Invalid or expired token", resCode.NOT_FOUND);
+    }
+
+    // ✅ Update password
+    const hashedPassword = await hashPassword(new_password);
+    customer.cus_password = hashedPassword;
+    customer.cus_confirm_password = hashedPassword;
+    customer.reset_token = ""; // clear token
+    await customer.save();
+
+    return responseHandler.success(res, "Password reset successful", {}, resCode.OK);
+  } catch (error) {
+    return next(error);
+  }
+};
+
 
 
 export default {
   signupCustomer,
   loginCustomer,
+  forgotPassword,
+  resetPassword,
 };

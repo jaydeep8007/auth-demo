@@ -4,24 +4,28 @@ import customerAuthModel from "../../models/mysql/customerAuth.model";
 import { hashPassword, comparePasswords } from "../../services/password.service";
 import { responseHandler } from "../../services/responseHandler.service";
 import { resCode } from "../../constants/resCode";
-import jwt from "jsonwebtoken";
+import { authToken } from "../../services/authToken.service";
 import { Op } from "sequelize";
 
-// 🔐 Signup (Register)
+// 📝 SIGNUP
 const signupCustomer = async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { cus_password, cus_confirm_password, ...rest } = req.body;
+    const {
+      cus_password,
+      cus_confirm_password,
+      cus_email,
+      cus_phone_number,
+      ...rest
+    } = req.body;
 
     if (cus_password !== cus_confirm_password) {
       return responseHandler.error(res, "Passwords do not match", resCode.BAD_REQUEST);
     }
 
+    // Check if email or phone is already registered
     const existing = await customerModel.findOne({
       where: {
-        [Op.or]: [
-          { cus_email: req.body.cus_email },
-          { cus_phone_number: req.body.cus_phone_number },
-        ],
+        [Op.or]: [{ cus_email }, { cus_phone_number }],
       },
     });
 
@@ -31,22 +35,54 @@ const signupCustomer = async (req: Request, res: Response, next: NextFunction) =
 
     const hashedPassword = await hashPassword(cus_password);
 
-    const customer = await customerModel.create({
-      ...rest,
+    // Create new customer
+    const newCustomer = await customerModel.create({
+      cus_email,
+      cus_phone_number,
       cus_password: hashedPassword,
       cus_confirm_password: hashedPassword,
+      ...rest,
     });
 
-    return responseHandler.success(res, "Signup successful", customer, resCode.CREATED);
+    // Extract customer data to access cus_id
+    const customerData = newCustomer.get();
+
+    const token = authToken.generateAuthToken({
+      user_id: customerData.cus_id,
+      email: customerData.cus_email,
+    });
+
+    const refreshToken = authToken.generateRefreshAuthToken({
+      user_id: customerData.cus_id,
+      email: customerData.cus_email,
+    });
+
+    // Save tokens in customer_auth table
+    await customerAuthModel.create({
+      cus_id: customerData.cus_id,
+      cus_auth_token: token,
+      cus_refresh_auth_token: refreshToken,
+    });
+
+    return responseHandler.success(
+      res,
+      "Signup successful",
+      { token, refreshToken, customer: customerData },
+      resCode.CREATED
+    );
   } catch (error) {
     return next(error);
   }
 };
 
-// 🔑 Login
+// 🔐 LOGIN
 const loginCustomer = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { cus_email, cus_password } = req.body;
+
+    if (!cus_email || !cus_password) {
+      return responseHandler.error(res, "Email and password are required", resCode.BAD_REQUEST);
+    }
 
     const customer = await customerModel.findOne({ where: { cus_email } });
 
@@ -54,35 +90,33 @@ const loginCustomer = async (req: Request, res: Response, next: NextFunction) =>
       return responseHandler.error(res, "Customer not found", resCode.NOT_FOUND);
     }
 
-    // const isPasswordValid = await comparePasswords(cus_password, customer.cus_password);
+    const customerData = customer.get();
+    const isPasswordValid = await comparePasswords(cus_password, customerData.cus_password);
+    if (!isPasswordValid) {
+      return responseHandler.error(res, "Invalid password", resCode.UNAUTHORIZED);
+    }
 
-    // if (!isPasswordValid) {
-    //   return responseHandler.error(res, "Invalid password", resCode.UNAUTHORIZED);
-    // }
+    const token = authToken.generateAuthToken({
+      user_id: customerData.cus_id,
+      email: customerData.cus_email,
+    });
 
-    // Generate JWT token
-    // const token = jwt.sign(
-    //   { id: customer.cus_id, email: customer.cus_email },
-    //   process.env.JWT_SECRET as string,
-    //   { expiresIn: "1d" }
-    // );
+    const refreshToken = authToken.generateRefreshAuthToken({
+      user_id: customerData.cus_id,
+      email: customerData.cus_email,
+    });
 
-    // const refreshToken = jwt.sign(
-    //   { id: customer.cus_id, email: customer.cus_email },
-    //   process.env.JWT_REFRESH_SECRET as string,
-    //   { expiresIn: "7d" }
-    // );
-
-    // await customerAuthModel.create({
-    //   cus_id: customer.cus_id,
-    //   cus_auth_token: token,
-    //   cus_refresh_auth_token: refreshToken,
-    // });
+    // Save tokens in customer_auth table
+    await customerAuthModel.create({
+      cus_id: customerData.cus_id,
+      cus_auth_token: token,
+      cus_refresh_auth_token: refreshToken,
+    });
 
     return responseHandler.success(
       res,
       "Login successful",
-      // { token, refreshToken, customer },
+      { token, refreshToken, customer: customerData },
       resCode.OK
     );
   } catch (error) {
